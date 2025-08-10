@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta]
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: ${{ matrix.rust }}
+        override: true
+        components: rustfmt, clippy
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v3
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v3
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Check formatting
+      run: cargo fmt -- --check
+      if: matrix.rust == 'stable'
+    
+    - name: Run clippy (without MCP feature)
+      run: cargo clippy -- -D warnings
+      if: matrix.rust == 'stable'
+    
+    - name: Build
+      run: cargo build --verbose
+    
+    - name: Build with MCP feature
+      run: cargo build --features mcp --verbose
+      if: matrix.rust == 'stable'
+    
+    - name: Run tests
+      run: cargo test --verbose
+    
+    - name: Run tests with MCP feature
+      run: cargo test --features mcp --verbose
+      if: matrix.rust == 'stable'
+    
+    - name: Build release
+      run: cargo build --release --verbose
+      if: matrix.rust == 'stable'
+    
+    - name: Test version command
+      run: ./target/debug/webprobe version
+      if: matrix.os != 'windows-latest'
+    
+    - name: Test version command (Windows)
+      run: .\target\debug\webprobe.exe version
+      if: matrix.os == 'windows-latest'
+    
+  publish-dry-run:
+    name: Publish dry run
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: Cargo publish dry run
+      run: cargo publish --dry-run

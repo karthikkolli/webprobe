@@ -1,0 +1,431 @@
+WEBPROBE - Web Browser Inspection Tool for LLMs
+
+OVERVIEW
+--------
+webprobe is a command-line tool that allows LLMs to inspect and analyze web pages programmatically. It provides precise measurements, positions, and layout information about web elements without requiring visual rendering. The tool acts as "eyes" that report facts, while the LLM acts as the "brain" that diagnoses issues.
+
+WHEN TO USE WEBPROBE
+--------------------
+USE WHEN:
+- User reports visual/layout issues on a webpage ("nav has too much space", "button is hidden", "cards wrap incorrectly")
+- Need to verify element positions, sizes, or visibility
+- Debugging CSS layout problems (spacing, alignment, overflow, wrapping)
+- Need to understand page structure without seeing it
+- Checking responsive design at different viewport sizes
+- Automating web interactions (clicking, typing, scrolling)
+- Extracting computed styles and element properties
+- Finding elements that match specific CSS selectors
+- Debugging why elements appear broken or misaligned
+- Need to analyze multiple elements with the same selector
+
+DO NOT USE WHEN:
+- User needs to extract large amounts of text content (use web scraping tools instead)
+- Need to debug JavaScript functionality (use browser console)
+- Testing API endpoints (use curl or API testing tools)
+- Need visual screenshots (webprobe provides data, not images)
+- Checking if a website is online (use ping or curl)
+- Need to monitor website performance (use performance tools)
+- User asks about code structure (use code reading tools)
+- Need persistent sessions for multi-step authentication (use daemon mode instead)
+
+INSTALLATION REQUIREMENTS
+------------------------
+webprobe automatically starts WebDriver processes! Just ensure they're installed:
+
+For Firefox:
+  macOS: brew install geckodriver
+  Linux: Download from GitHub releases and add to PATH
+
+For Chrome:
+  macOS: brew install chromedriver  
+  Linux: Download from ChromeDriver site and add to PATH
+
+Note: No need to manually start geckodriver or chromedriver - webprobe handles this automatically!
+
+PERFORMANCE OPTIMIZATION
+-----------------------
+webprobe features a browser pool for significantly faster one-shot commands when daemon is running:
+- First command: Creates browser instance (normal speed)
+- Subsequent commands: Reuse pooled browser (~0.3s vs several seconds)
+- Pool maintains up to 3 browsers, auto-cleans after 5 minutes
+- Automatic fallback to normal mode if daemon not running
+
+CORE COMMANDS
+-------------
+
+1. INSPECT - Get element properties
+   webprobe inspect <URL> <SELECTOR> [OPTIONS]
+   
+   Options:
+     --all              Return all matching elements (not just first)
+     --index <n>        Return element at index n (0-based)
+     --expect-one       Error if multiple elements found
+     --browser <type>   firefox (default) or chrome
+     --viewport <WxH>   Set viewport size (e.g., 1920x1080)
+     --format <type>    json (default) or simple
+     --headless <bool>  true (default) or false
+
+2. ANALYZE - Get layout context for debugging
+   webprobe analyze <URL> <SELECTOR> [OPTIONS]
+   
+   Options:
+     --focus <mode>     What to analyze:
+                        - spacing: gaps, margins, adjacent elements
+                        - wrapping: container/child widths, row calculations
+                        - anomalies: hidden elements, overflow, z-index issues
+                        - all: comprehensive analysis
+     --index <n>        Analyze element at index n when multiple match
+     --proximity <px>   Include elements within distance (default: 100)
+
+3. CLICK - Click an element
+   webprobe click <URL> <SELECTOR> [OPTIONS]
+   
+   Options:
+     --index <n>        Click element at index n
+
+4. TYPE - Enter text into an input
+   webprobe type <URL> <SELECTOR> <TEXT> [OPTIONS]
+   
+   Options:
+     --clear            Clear field before typing
+
+5. SCROLL - Scroll page or element
+   webprobe scroll <URL> [OPTIONS]
+   
+   Options:
+     --selector <sel>   Element to scroll (default: window)
+     --by-x <pixels>    Scroll horizontally
+     --by-y <pixels>    Scroll vertically
+     --to <position>    Scroll to: top, bottom, or x,y
+
+6. EVAL - Execute JavaScript
+   webprobe eval <CODE> --url <URL> [OPTIONS]
+
+7. DAEMON - Manage background daemon for persistent sessions & browser pool
+   webprobe daemon start          Start daemon in background (enables browser pool)
+   webprobe daemon status         Check if daemon is running
+   webprobe daemon stop           Stop the daemon
+   
+   BENEFITS:
+   - Enables persistent tabs for authentication workflows
+   - Activates browser pool for ~10x faster one-shot commands
+   - Maintains browser instances across CLI invocations
+   
+8. TAB - Manage persistent browser tabs (requires daemon)
+   webprobe tab list                    List all active tabs
+   webprobe tab list --profile <NAME>   List tabs filtered by profile
+   webprobe tab close <NAME>            Close a specific tab
+   webprobe tab close-all         Close all tabs
+   
+PERSISTENT SESSIONS WITH --tab FLAG:
+When daemon is running, use --tab <name> with any command to maintain browser state:
+   webprobe inspect <URL> <SELECTOR> --tab <NAME>
+   webprobe type <URL> <SELECTOR> <TEXT> --tab <NAME>
+   webprobe click <URL> <SELECTOR> --tab <NAME>
+
+PROFILE ISOLATION:
+Use --profile <name> with --tab to create isolated browser sessions:
+   webprobe inspect <URL> <SELECTOR> --tab <NAME> --profile <PROFILE>
+   
+Profiles provide complete cookie/storage isolation for parallel testing:
+   # Test production environment
+   webprobe type "url" "input" "prod-key" --tab prod --profile production
+   
+   # Simultaneously test staging (different cookies/auth)
+   webprobe type "url" "input" "staging-key" --tab staging --profile staging
+   
+   # List tabs by profile
+   webprobe tab list --profile production
+
+CRITICAL FEATURE: MULTIPLE ELEMENT HANDLING
+--------------------------------------------
+PROBLEM: When multiple elements match a selector, webprobe returns only the first by default, which might not be the problematic one.
+
+SOLUTION: Webprobe warns when multiple matches exist:
+- Returns metadata with total_matches count
+- Shows warning: "3 elements match '.nav'. Showing first. Use --all to see all."
+- Supports --index to target specific elements
+
+ALWAYS START WITH DISCOVERY:
+1. First check how many elements match:
+   webprobe inspect "url" ".nav" --all
+   
+2. Then target the specific problematic element:
+   webprobe analyze "url" ".nav" --index 1 --focus spacing
+
+EXAMPLE WORKFLOWS
+-----------------
+
+WORKFLOW 1: User reports "Navigation has too much space above it"
+
+Step 1: Check if multiple navs exist
+  webprobe inspect "https://site.com" "nav" --all
+  
+  If multiple found, identify which one user means:
+  - First nav at y=0 (top navigation)
+  - Second nav at y=500 (sidebar)
+
+Step 2: Analyze spacing for the correct nav
+  webprobe analyze "https://site.com" "nav" --index 0 --focus spacing
+
+Step 3: Interpret the data
+  If output shows:
+  {
+    "spacing_context": {
+      "adjacent_elements": [{
+        "position": "above",
+        "margin_bottom": 30,
+        "actual_gap": 30,
+        "margin_collapsed": true
+      }]
+    }
+  }
+  
+  Diagnosis: 30px gap caused by margin collapse
+  Solution: Add padding to container to prevent collapse
+
+WORKFLOW 2: User reports "Cards should show 3 per row but only 2 fit"
+
+Step 1: Analyze wrapping behavior
+  webprobe analyze "https://site.com" ".card-container" --focus wrapping
+
+Step 2: Interpret the data
+  If output shows:
+  {
+    "container": {"width": 1000, "available_width": 960},
+    "children": {"per_row": 2},
+    "width_calculation": {
+      "total_children_width": 990,
+      "overflow": 30
+    }
+  }
+  
+  Diagnosis: 3 cards × 330px = 990px, but only 960px available
+  Solution: Reduce card width or remove container padding
+
+WORKFLOW 3: User reports "Something is broken on the page"
+
+Step 1: Run anomaly detection
+  webprobe analyze "https://site.com" "body" --focus anomalies
+
+Step 2: Check for common issues in output:
+  - Elements with negative z-index (hidden behind page)
+  - Elements with opacity: 0 (invisible but taking space)
+  - Elements extending beyond viewport (horizontal scroll)
+  - Text with same color as background (invisible text)
+
+WORKFLOW 4: Verify element is clickable
+
+Step 1: Inspect the button
+  webprobe inspect "https://site.com" "button.submit" --expect-one
+
+Step 2: If it exists and is visible, click it
+  webprobe click "https://site.com" "button.submit"
+
+OUTPUT INTERPRETATION
+---------------------
+
+INSPECT OUTPUT:
+{
+  "selector": ".nav",
+  "position": {"x": 0, "y": 50},      // Element location
+  "size": {"width": 1200, "height": 60}, // Element dimensions
+  "metadata": {                        // WARNING SYSTEM
+    "total_matches": 3,               // Multiple elements found!
+    "returned_index": 0,              // Showing the first one
+    "warning": "3 elements match..." // Action needed
+  }
+}
+
+ANALYZE SPACING OUTPUT:
+{
+  "target": {
+    "box": {
+      "margin": {"top": 20, "bottom": 20},
+      "padding": {"top": 10, "bottom": 10}
+    }
+  },
+  "spacing_context": {
+    "adjacent_elements": [{
+      "position": "above",
+      "actual_gap": 30,          // Real measured gap
+      "margin_collapsed": true   // Margins are collapsing
+    }]
+  }
+}
+
+ANALYZE WRAPPING OUTPUT:
+{
+  "container": {
+    "width": 1000,
+    "available_width": 960      // After padding
+  },
+  "children": {
+    "per_row": 2,               // Only 2 fit per row
+    "child_analysis": [{
+      "index": 2,
+      "wrapped": true,          // This one wrapped
+      "row": 2                  // To the second row
+    }]
+  },
+  "width_calculation": {
+    "total_children_width": 990,
+    "overflow": 30              // 30px too wide
+  }
+}
+
+BEST PRACTICES
+--------------
+
+1. ALWAYS CHECK FOR MULTIPLE MATCHES
+   Bad:  webprobe inspect "url" ".nav"
+   Good: webprobe inspect "url" ".nav" --all
+   
+   Then: webprobe inspect "url" ".nav" --index <correct_one>
+
+2. USE SPECIFIC SELECTORS WHEN POSSIBLE
+   Bad:  ".button"
+   Good: "#submit-button"
+   Better: "form#login button[type='submit']"
+
+3. USE --expect-one FOR UNIQUE ELEMENTS
+   webprobe inspect "url" "#unique-id" --expect-one
+   This will error if multiple found, catching problems early
+
+4. USE APPROPRIATE FOCUS FOR ANALYZE
+   Spacing issues: --focus spacing
+   Wrapping issues: --focus wrapping
+   General issues: --focus anomalies
+   Complete analysis: --focus all
+
+5. START BROAD, THEN NARROW
+   First:  analyze "body" --focus anomalies
+   Then:   analyze ".specific-element" --focus spacing
+
+COMMON PITFALLS
+---------------
+
+1. ASSUMING SELECTOR UNIQUENESS
+   Problem: Debugging first element when problem is in second
+   Solution: Always use --all first to check
+
+2. USING WRONG FOCUS MODE
+   Problem: Using --focus all generates too much data
+   Solution: Use specific focus for specific problems
+
+3. NOT CHECKING VIEWPORT SIZE
+   Problem: Desktop layout issues don't appear on mobile viewport
+   Solution: Use --viewport to match user's screen size
+
+4. IGNORING METADATA WARNINGS
+   Problem: Missing the "total_matches" warning
+   Solution: Always check metadata field in output
+
+ERROR HANDLING
+--------------
+
+"No elements found matching selector"
+- Selector might be wrong
+- Page might not be loaded
+- Element might be in iframe (not accessible)
+
+"Expected exactly one element but found X"
+- Multiple elements match when uniqueness expected
+- Use more specific selector or --index
+
+"Cannot connect to WebDriver"
+- Start geckodriver or chromedriver first
+- Check if correct port is being used
+
+AUTHENTICATION AND PERSISTENT SESSIONS
+---------------------------------------
+DEFAULT BEHAVIOR: Each webprobe command opens a NEW browser instance and closes it after execution.
+This means authentication state is LOST between commands by default.
+
+SOLUTION: Use daemon mode with --tab flag for persistent sessions:
+
+1. Start the daemon:
+   webprobe daemon start
+   
+2. Use --tab flag to maintain browser state:
+   webprobe type "url" "input[type='email']" "user@example.com" --tab auth
+   webprobe type "url" "input[type='password']" "password" --tab auth
+   webprobe click "url" "button[type='submit']" --tab auth
+   # The 'auth' tab persists - you stay logged in!
+   
+3. Continue using the authenticated session:
+   webprobe inspect "url/dashboard" ".user-data" --tab auth
+   # Returns authenticated content
+   
+4. Clean up when done:
+   webprobe daemon stop
+
+ALTERNATIVE FOR SIMPLE AUTH:
+Use JavaScript to perform all login steps in one command:
+   webprobe eval "
+     document.querySelector('input[type=\"email\"]').value = 'user@example.com';
+     document.querySelector('input[type=\"password\"]').value = 'password';
+     document.querySelector('button[type=\"submit\"]').click();
+     return 'logged in';
+   " --url "http://site.com"
+
+ADVANCED USAGE
+--------------
+
+1. DAEMON MODE FOR STATEFUL OPERATIONS
+   # Start daemon for persistent browser sessions
+   webprobe daemon start
+   
+   # Create multiple named tabs for different contexts
+   webprobe inspect "https://app1.com" "body" --tab app1
+   webprobe inspect "https://app2.com" "body" --tab app2
+   
+   # Use profiles for complete session isolation
+   webprobe inspect "https://api.com" "body" --tab prod --profile production
+   webprobe inspect "https://api.com" "body" --tab dev --profile development
+   
+   # Tabs persist until explicitly closed or daemon stops
+   webprobe tab list                      # Shows all tabs
+   webprobe tab list --profile production  # Shows only production tabs
+   webprobe tab close app1
+   webprobe daemon stop
+
+2. PROFILE MANAGEMENT (stores cookies, persists across browser restarts)
+   webprobe profile create "my-profile" --browser chrome
+   webprobe inspect "url" "selector" --profile "my-profile"
+   # Profile saves cookies, localStorage, etc.
+
+3. JAVASCRIPT EXECUTION
+   webprobe eval "return document.title" --url "https://site.com"
+   webprobe eval "return document.querySelectorAll('.item').length" --url "https://site.com"
+
+4. CHAINING COMMANDS WITH PERSISTENT TABS
+   # Start daemon
+   webprobe daemon start
+   
+   # Use same tab for all operations
+   webprobe inspect "url" ".card" --all --tab workflow
+   webprobe analyze "url" ".card" --index 2 --focus spacing --tab workflow
+   webprobe click "url" ".card" --index 2 --tab workflow
+   # Browser stays open, state is maintained
+   
+   # Clean up
+   webprobe daemon stop
+
+5. MULTI-STEP WORKFLOWS
+   # First inspect to find all elements
+   webprobe inspect "url" ".card" --all
+   
+   # Then analyze specific problematic one
+   webprobe analyze "url" ".card" --index 2 --focus spacing
+   
+   # Finally interact with it
+   webprobe click "url" ".card" --index 2
+
+REMEMBER
+--------
+- webprobe provides DATA, not visual rendering
+- webprobe reports FACTS, LLM provides DIAGNOSIS
+- Always verify multiple elements don't exist
+- Use focused analysis for specific problems
+- Metadata warnings are critical debugging information
