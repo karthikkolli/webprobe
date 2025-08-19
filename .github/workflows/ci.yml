@@ -17,79 +17,206 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
+        browser: [chrome, firefox]
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
-        override: true
         components: rustfmt, clippy
     
     - name: Cache cargo registry
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cargo/registry
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
     
     - name: Cache cargo index
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
     
     - name: Cache cargo build
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Setup Chrome and ChromeDriver (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        # Add Chrome repo
+        wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+        sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
+        sudo apt-get update
+        sudo apt-get install -y google-chrome-stable
+        
+        # Get Chrome version and install matching ChromeDriver
+        CHROME_VERSION=$(google-chrome --version | cut -d ' ' -f 3 | cut -d '.' -f 1)
+        echo "Chrome major version: $CHROME_VERSION"
+        
+        # Get the latest ChromeDriver version for this Chrome version
+        CHROMEDRIVER_VERSION=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_$CHROME_VERSION")
+        echo "ChromeDriver version: $CHROMEDRIVER_VERSION"
+        
+        # Download and install ChromeDriver
+        wget -q "https://storage.googleapis.com/chrome-for-testing-public/$CHROMEDRIVER_VERSION/linux64/chromedriver-linux64.zip"
+        unzip -q chromedriver-linux64.zip
+        sudo mv chromedriver-linux64/chromedriver /usr/local/bin/
+        sudo chmod +x /usr/local/bin/chromedriver
+        chromedriver --version
+    
+    - name: Setup Firefox and GeckoDriver (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get install -y firefox
+        FIREFOX_VERSION=$(firefox --version | grep -oP '\d+\.\d+' || echo "unknown")
+        echo "Firefox version: $FIREFOX_VERSION"
+        GECKODRIVER_VERSION=$(curl -s https://api.github.com/repos/mozilla/geckodriver/releases/latest | grep -oP '"tag_name": "\K[^"]+')
+        echo "GeckoDriver version: $GECKODRIVER_VERSION"
+        wget -q "https://github.com/mozilla/geckodriver/releases/download/$GECKODRIVER_VERSION/geckodriver-$GECKODRIVER_VERSION-linux64.tar.gz"
+        tar -xzf "geckodriver-${GECKODRIVER_VERSION}-linux64.tar.gz"
+        sudo mv geckodriver /usr/local/bin/
+        sudo chmod +x /usr/local/bin/geckodriver
+        geckodriver --version
+    
+    - name: Setup Chrome and ChromeDriver (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install --cask google-chrome
+        brew install chromedriver
+        chromedriver --version
+    
+    - name: Setup Firefox and GeckoDriver (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install --cask firefox
+        brew install geckodriver
+        geckodriver --version
+    
+    - name: Setup Chrome and ChromeDriver (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        choco install googlechrome -y
+        choco install chromedriver -y
+        chromedriver --version
+      shell: powershell
+    
+    - name: Setup Firefox and GeckoDriver (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        choco install firefox -y
+        choco install selenium-gecko-driver -y
+        geckodriver --version
+      shell: powershell
+    
+    - name: Build before starting services
+      run: cargo build --verbose
+    
+    - name: Start WebDriver and Daemon services
+      run: |
+        # Note: WebDriver processes are now managed automatically by webprobe
+        # The daemon will start them as needed
+        
+        # Start the webprobe daemon in background with the test browser
+        ./target/debug/webprobe daemon start --browser ${{ matrix.browser }} &
+        
+        # Give daemon time to start and initialize
+        sleep 5
+        
+        # Verify daemon is running
+        ./target/debug/webprobe daemon status || echo "Daemon status check"
+      if: matrix.os != 'windows-latest'
+    
+    - name: Start WebDriver and Daemon services (Windows)
+      run: |
+        # Start the webprobe daemon in background with the test browser
+        Start-Process -FilePath "./target/debug/webprobe.exe" -ArgumentList "daemon", "start", "--browser", "${{ matrix.browser }}" -WindowStyle Hidden
+        
+        # Give daemon time to start
+        Start-Sleep -Seconds 5
+        
+        # Verify daemon is running
+        ./target/debug/webprobe.exe daemon status
+      shell: powershell
+      if: matrix.os == 'windows-latest'
     
     - name: Check formatting
       run: cargo fmt -- --check
       if: matrix.rust == 'stable'
     
-    - name: Run clippy (without MCP feature)
+    - name: Run clippy
       run: cargo clippy -- -D warnings
       if: matrix.rust == 'stable'
     
-    - name: Build
-      run: cargo build --verbose
-    
-    - name: Build with MCP feature
-      run: cargo build --features mcp --verbose
-      if: matrix.rust == 'stable'
-    
     - name: Run tests
-      run: cargo test --verbose
-    
-    - name: Run tests with MCP feature
-      run: cargo test --features mcp --verbose
-      if: matrix.rust == 'stable'
+      run: |
+        # Run unit tests normally
+        cargo test --lib --verbose
+        # Run integration tests with single thread for daemon tests
+        # Test with the matrix browser on all platforms (including ignored tests)
+        TEST_BROWSER=${{ matrix.browser }} cargo test --test '*' -- --test-threads=1 --include-ignored
+      env:
+        RUST_BACKTRACE: 1
     
     - name: Build release
       run: cargo build --release --verbose
       if: matrix.rust == 'stable'
+    
+    - name: Test CLI commands with daemon
+      run: |
+        # Test that commands work with daemon running
+        ./target/debug/webprobe inspect "https://example.com" "h1" || echo "Inspect test"
+        ./target/debug/webprobe tab list || echo "Tab list test"
+      if: matrix.os != 'windows-latest'
+    
+    - name: Test CLI commands with daemon (Windows)
+      run: |
+        # Test that commands work with daemon running
+        ./target/debug/webprobe.exe inspect "https://example.com" "h1"
+        ./target/debug/webprobe.exe tab list
+      shell: powershell
+      if: matrix.os == 'windows-latest'
+    
+    - name: Stop daemon
+      run: |
+        ./target/debug/webprobe daemon stop || echo "Daemon stop"
+        # Kill any remaining WebDriver processes
+        pkill -f chromedriver || true
+        pkill -f geckodriver || true
+      if: matrix.os != 'windows-latest'
+    
+    - name: Stop daemon (Windows)
+      run: |
+        ./target/debug/webprobe.exe daemon stop
+        # Kill any remaining WebDriver processes
+        Stop-Process -Name chromedriver -ErrorAction SilentlyContinue
+        Stop-Process -Name geckodriver -ErrorAction SilentlyContinue
+      shell: powershell
+      if: matrix.os == 'windows-latest'
     
     - name: Test version command
       run: ./target/debug/webprobe version
       if: matrix.os != 'windows-latest'
     
     - name: Test version command (Windows)
-      run: .\target\debug\webprobe.exe version
+      run: ./target/debug/webprobe.exe version
+      shell: powershell
       if: matrix.os == 'windows-latest'
     
   publish-dry-run:
     name: Publish dry run
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: stable
-        override: true
     
     - name: Cargo publish dry run
       run: cargo publish --dry-run

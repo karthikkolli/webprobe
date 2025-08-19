@@ -3,6 +3,12 @@
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+pub mod daemon;
+pub mod test_guard;
+
+// Re-export commonly used guards and helpers
+pub use test_guard::{DaemonTestGuard, get_test_browser};
+
 /// Create a temporary directory for test profiles
 #[allow(dead_code)]
 pub fn create_temp_profile_dir() -> (TempDir, PathBuf) {

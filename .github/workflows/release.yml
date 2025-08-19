@@ -90,8 +90,8 @@ jobs:
             artifact_name: webprobe
             asset_name: webprobe-darwin-arm64
           
-          # Windows builds
-          - os: windows-latest
+          # Windows builds (using beta for faster builds)
+          - os: windows-latest-beta
             target: x86_64-pc-windows-msvc
             artifact_name: webprobe.exe
             asset_name: webprobe-windows.exe
@@ -116,10 +116,6 @@ jobs:
       run: cargo build --release --target ${{ matrix.target }}
       env:
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-    
-    - name: Build with MCP support (native only)
-      if: '!matrix.use_cross'
-      run: cargo build --release --target ${{ matrix.target }} --features mcp
     
     - name: Rename binary
       run: |
@@ -146,8 +142,10 @@ jobs:
         toolchain: stable
         override: true
     
-    - name: Install cargo-deb
-      run: cargo install cargo-deb
+    - name: Install packaging tools
+      run: |
+        cargo install cargo-deb
+        cargo install cargo-generate-rpm
     
     - name: Build
       run: cargo build --release
@@ -155,15 +153,31 @@ jobs:
     - name: Build .deb package
       run: cargo deb --no-build
     
-    - name: Find deb file
-      id: find_deb
-      run: echo "DEB_FILE=$(ls target/debian/*.deb)" >> $GITHUB_OUTPUT
+    - name: Build .rpm package
+      run: cargo generate-rpm
     
-    - name: Upload .deb package
+    - name: Find and rename package files
+      id: find_packages
+      run: |
+        # Rename DEB to generic name
+        DEB_ORIGINAL=$(ls target/debian/*.deb)
+        DEB_GENERIC="webprobe_amd64.deb"
+        cp "$DEB_ORIGINAL" "$DEB_GENERIC"
+        echo "DEB_FILE=$DEB_GENERIC" >> $GITHUB_OUTPUT
+        
+        # Rename RPM to generic name
+        RPM_ORIGINAL=$(ls target/generate-rpm/*.rpm)
+        RPM_GENERIC="webprobe.x86_64.rpm"
+        cp "$RPM_ORIGINAL" "$RPM_GENERIC"
+        echo "RPM_FILE=$RPM_GENERIC" >> $GITHUB_OUTPUT
+    
+    - name: Upload packages
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ github.ref_name }}
-        files: ${{ steps.find_deb.outputs.DEB_FILE }}
+        files: |
+          ${{ steps.find_packages.outputs.DEB_FILE }}
+          ${{ steps.find_packages.outputs.RPM_FILE }}
 
   publish-crate:
     name: Publish to crates.io

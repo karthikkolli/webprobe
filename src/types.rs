@@ -2,6 +2,45 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Core profiles that always exist in the daemon
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CoreProfile {
+    /// Default profile for normal tab operations
+    Default,
+    /// Special profile for stateless one-shot operations
+    OneShot,
+}
+
+/// Profile for browser isolation - either core or custom
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Profile {
+    /// Core profiles (Default, OneShot)
+    Core(CoreProfile),
+    /// Custom user-defined profiles
+    Custom(String),
+}
+
+impl Profile {
+    /// Get the profile name for browser isolation
+    pub fn name(&self) -> String {
+        match self {
+            Profile::Core(CoreProfile::Default) => "default".to_string(),
+            Profile::Core(CoreProfile::OneShot) => "oneshot".to_string(),
+            Profile::Custom(name) => name.clone(),
+        }
+    }
+
+    /// Parse a profile from an optional string
+    pub fn from_optional_string(s: Option<String>) -> Self {
+        match s {
+            None => Profile::Core(CoreProfile::Default),
+            Some(s) if s == "default" => Profile::Core(CoreProfile::Default),
+            Some(s) if s == "oneshot" => Profile::Core(CoreProfile::OneShot),
+            Some(s) => Profile::Custom(s),
+        }
+    }
+}
+
 /// Depth of element inspection
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -27,7 +66,7 @@ pub enum OutputFormat {
 }
 
 /// Complete information about a web element
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementInfo {
     /// CSS selector used to find this element
     pub selector: String,
@@ -49,7 +88,7 @@ pub struct ElementInfo {
 }
 
 /// Metadata about element selection when multiple matches exist
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementMetadata {
     /// Total number of elements matching the selector
     pub total_matches: usize,
@@ -61,7 +100,7 @@ pub struct ElementMetadata {
 }
 
 /// Position of an element on the page
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     /// X coordinate
     pub x: f64,
@@ -72,7 +111,7 @@ pub struct Position {
 }
 
 /// Size dimensions of an element
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Size {
     /// Width of the element
     pub width: f64,
@@ -82,8 +121,27 @@ pub struct Size {
     pub unit: String,
 }
 
-/// Browser viewport dimensions
+/// Text search result
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextSearchResult {
+    /// CSS selector for this element
+    pub selector: String,
+    /// HTML tag name
+    pub tag: String,
+    /// Text content
+    pub text: String,
+    /// Position on the page
+    pub position: serde_json::Value,
+    /// Size of the element
+    pub size: serde_json::Value,
+    /// Whether element is visible
+    pub visible: bool,
+    /// Element attributes
+    pub attributes: serde_json::Value,
+}
+
+/// Browser viewport dimensions
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ViewportSize {
     /// Viewport width in pixels
     pub width: u32,
@@ -154,6 +212,26 @@ pub struct BoundingBox {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+/// Diagnostic result for analyze command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticResult {
+    /// Clear statement of the issue (or "No issues detected")
+    pub diagnosis: String,
+
+    /// Confidence score from 0.0 to 1.0
+    pub confidence: f64,
+
+    /// Array of supporting facts/evidence
+    pub evidence: Vec<String>,
+
+    /// Suggested fix (if applicable)
+    pub suggested_fix: Option<String>,
+
+    /// Raw data for additional context
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_data: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

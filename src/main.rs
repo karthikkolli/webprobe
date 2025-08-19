@@ -2,25 +2,33 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::str::FromStr;
-use tracing::{debug, info};
+use serde_json::json;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod browser_pool;
+pub mod browser_manager;
+pub mod browser_pool;
+mod commands;
 mod daemon;
+mod errors;
 mod profile;
-mod tab_manager;
-mod types;
-mod webdriver;
+pub mod types;
+pub mod webdriver;
 mod webdriver_manager;
 
-#[cfg(feature = "mcp")]
-mod mcp_server;
 
-use profile::ProfileManager;
-use tab_manager::GLOBAL_TAB_MANAGER;
-use types::{InspectionDepth, OutputFormat, ViewportSize};
-use webdriver::{Browser, BrowserType};
+// Exit codes
+const EXIT_SUCCESS: i32 = 0;
+const _EXIT_COMMAND_ERROR: i32 = 1;
+const _EXIT_ELEMENT_NOT_FOUND: i32 = 2;
+const _EXIT_MULTIPLE_ELEMENTS: i32 = 3;
+const _EXIT_WEBDRIVER_FAILED: i32 = 4;
+const _EXIT_TIMEOUT: i32 = 5;
+
+use crate::commands::daemon::DaemonCommands;
+use crate::commands::profile::ProfileCommands;
+use crate::commands::session::SessionCommands;
+use crate::commands::tab::TabCommands;
+use types::{InspectionDepth, OutputFormat};
 
 #[derive(Parser)]
 #[command(name = "webprobe")]
@@ -30,7 +38,7 @@ struct Cli {
     command: Commands,
 
     /// Global session name
-    #[arg(short, long, global = true)]
+    #[arg(long, global = true)]
     session: Option<String>,
 }
 
@@ -43,10 +51,6 @@ enum Commands {
 
         /// CSS selector for the element
         selector: String,
-
-        /// Browser to use
-        #[arg(short, long, default_value = "firefox")]
-        browser: String,
 
         /// Profile to use (temporary if not specified)
         #[arg(short, long)]
@@ -75,10 +79,6 @@ enum Commands {
         /// Set viewport size (WIDTHxHEIGHT, e.g., 1920x1080)
         #[arg(long)]
         viewport: Option<String>,
-
-        /// Run browser in visible mode (disables headless)
-        #[arg(long = "no-headless")]
-        no_headless: bool,
 
         /// Use a persistent tab (creates if doesn't exist)
         #[arg(long)]
@@ -200,6 +200,73 @@ enum Commands {
         tab: Option<String>,
     },
 
+    /// Take a screenshot of the page or element
+    Screenshot {
+        /// URL to navigate to (optional if using tab)
+        #[arg(default_value = "")]
+        url: String,
+
+        /// CSS selector for element (optional, captures full page if not specified)
+        #[arg(short, long)]
+        selector: Option<String>,
+
+        /// Output file path (PNG format)
+        #[arg(short, long, default_value = "screenshot.png")]
+        output: String,
+
+        /// Browser to use
+        #[arg(short, long, default_value = "firefox")]
+        browser: String,
+
+        /// Profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Viewport size (WIDTHxHEIGHT, e.g., 1920x1080)
+        #[arg(long)]
+        viewport: Option<String>,
+
+        /// Run browser in visible mode
+        #[arg(long = "no-headless")]
+        no_headless: bool,
+
+        /// Use a persistent tab
+        #[arg(long)]
+        tab: Option<String>,
+    },
+
+    /// Inspect elements within iframes
+    Iframe {
+        /// URL to navigate to
+        url: String,
+
+        /// Iframe selector (e.g., #myframe, iframe[name='content'])
+        iframe: String,
+
+        /// Element selector within the iframe
+        selector: String,
+
+        /// Browser to use
+        #[arg(short, long, default_value = "firefox")]
+        browser: String,
+
+        /// Profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Run browser in visible mode
+        #[arg(long = "no-headless")]
+        no_headless: bool,
+
+        /// Output format
+        #[arg(short, long, default_value = "json")]
+        format: OutputFormat,
+
+        /// Use a persistent tab
+        #[arg(long)]
+        tab: Option<String>,
+    },
+
     /// Analyze element layout with box model details
     Layout {
         /// URL to analyze
@@ -224,17 +291,9 @@ enum Commands {
         #[arg(long, default_value = "false")]
         detect_shadow: bool,
 
-        /// Browser to use
-        #[arg(short, long, default_value = "firefox")]
-        browser: String,
-
         /// Profile to use
         #[arg(short, long)]
         profile: Option<String>,
-
-        /// Run browser in visible mode (disables headless)
-        #[arg(long = "no-headless")]
-        no_headless: bool,
 
         /// Output format
         #[arg(short, long, default_value = "json")]
@@ -247,7 +306,7 @@ enum Commands {
 
     /// Execute JavaScript in the browser
     Eval {
-        /// URL to navigate to (optional if using session)
+        /// URL to navigate to (optional if using tab)
         #[arg(long)]
         url: Option<String>,
 
@@ -269,6 +328,14 @@ enum Commands {
         /// Output format
         #[arg(short, long, default_value = "json")]
         format: OutputFormat,
+
+        /// Use a persistent tab (requires daemon)
+        #[arg(long)]
+        tab: Option<String>,
+
+        /// REQUIRED: Acknowledge security risk of executing arbitrary JavaScript
+        #[arg(long)]
+        unsafe_eval: bool,
     },
 
     /// Click an element on a webpage
@@ -304,6 +371,158 @@ enum Commands {
         tab: Option<String>,
     },
 
+    /// Execute multiple commands in batch
+    Batch {
+        /// Commands as string or file path (use @ prefix for file, e.g., @commands.txt)
+        commands: String,
+
+        /// Tab to use (optional, requires daemon)
+        #[arg(long)]
+        tab: Option<String>,
+
+        /// Browser to use
+        #[arg(short, long, default_value = "chrome")]
+        browser: String,
+
+        /// Stop on first error
+        #[arg(long)]
+        stop_on_error: bool,
+
+        /// Run without showing browser window
+        #[arg(long, default_value = "true")]
+        headless: bool,
+
+        /// Browser profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Viewport size (WIDTHxHEIGHT)
+        #[arg(long)]
+        viewport: Option<String>,
+    },
+
+    /// Detect smart elements (forms, tables, navigation, etc)
+    Detect {
+        /// URL to inspect
+        url: String,
+
+        /// Context selector to limit detection scope
+        #[arg(long)]
+        context: Option<String>,
+
+        /// Tab to use (requires daemon)
+        #[arg(long)]
+        tab: Option<String>,
+
+        /// Browser to use
+        #[arg(short, long, default_value = "chrome")]
+        browser: String,
+
+        /// Browser profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
+    },
+
+    /// Find elements by text content
+    FindText {
+        /// Text to search for
+        text: String,
+
+        /// URL to search (or empty for current tab)
+        #[arg(long, default_value = "")]
+        url: String,
+
+        /// Element type filter (button, link, input, text, heading, etc)
+        #[arg(long, short = 't')]
+        element_type: Option<String>,
+
+        /// Use fuzzy matching (partial matches, similar text)
+        #[arg(long, short = 'f')]
+        fuzzy: bool,
+
+        /// Case sensitive search
+        #[arg(long, short = 'c')]
+        case_sensitive: bool,
+
+        /// Return all matches (default: all)
+        #[arg(long, default_value = "true")]
+        all: bool,
+
+        /// Return only Nth match (1-indexed)
+        #[arg(long)]
+        index: Option<usize>,
+
+        /// Tab to use (for persistent session)
+        #[arg(long)]
+        tab: Option<String>,
+
+        /// Profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Output format
+        #[arg(long, default_value = "json")]
+        format: OutputFormat,
+    },
+
+    /// Wait for navigation to occur (URL change)
+    WaitNavigation {
+        /// Current URL or empty to use current tab URL
+        #[arg(default_value = "")]
+        url: String,
+
+        /// URL pattern to wait for (can be partial match)
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Maximum time to wait in seconds
+        #[arg(long, default_value = "10")]
+        timeout: u64,
+
+        /// Tab to use (required)
+        #[arg(long)]
+        tab: String,
+
+        /// Browser to use
+        #[arg(short, long, default_value = "firefox")]
+        browser: String,
+    },
+
+    /// Wait for network to become idle
+    WaitIdle {
+        /// URL to navigate to (or empty for current tab)
+        #[arg(default_value = "")]
+        url: String,
+
+        /// Maximum time to wait in milliseconds
+        #[arg(long, default_value = "10000")]
+        timeout: u64,
+
+        /// Idle time threshold in milliseconds
+        #[arg(long, default_value = "500")]
+        idle_time: u64,
+
+        /// Tab to use (for persistent session)
+        #[arg(long)]
+        tab: Option<String>,
+
+        /// Browser to use
+        #[arg(short, long, default_value = "firefox")]
+        browser: String,
+
+        /// Profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Run browser in visible mode
+        #[arg(long = "no-headless")]
+        no_headless: bool,
+
+        /// Show network log after waiting
+        #[arg(long)]
+        show_log: bool,
+    },
+
     /// Manage browser sessions
     Session {
         #[command(subcommand)]
@@ -314,6 +533,21 @@ enum Commands {
     Tab {
         #[command(subcommand)]
         command: TabCommands,
+    },
+
+    /// Check session status for a tab
+    Status {
+        /// Tab name to check
+        #[arg(long)]
+        tab: String,
+
+        /// Browser to use
+        #[arg(short, long, default_value = "firefox")]
+        browser: String,
+
+        /// Profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
     },
 
     /// Manage browser profiles
@@ -328,9 +562,6 @@ enum Commands {
         command: DaemonCommands,
     },
 
-    /// Run as MCP (Model Context Protocol) server for Claude Code
-    #[cfg(feature = "mcp")]
-    McpServer,
 
     /// Show version information
     Version,
@@ -341,111 +572,157 @@ enum Commands {
         #[arg(long)]
         install: bool,
     },
-}
 
-#[derive(Subcommand)]
-enum TabCommands {
-    /// List all active tabs
-    List {
-        /// Filter tabs by profile
+    /// Diagnose layout issues on a webpage
+    Diagnose {
+        /// URL to diagnose
+        url: String,
+
+        /// CSS selector for specific element (optional, analyzes whole page if not specified)
         #[arg(long)]
-        profile: Option<String>,
-    },
+        selector: Option<String>,
 
-    /// Close a specific tab
-    Close {
-        /// Tab name
-        name: String,
-    },
+        /// Type of diagnosis (overflow, spacing, alignment, responsiveness, all)
+        #[arg(long, default_value = "all")]
+        check: String,
 
-    /// Close all tabs
-    CloseAll,
-}
-
-#[derive(Subcommand)]
-enum SessionCommands {
-    /// Create a new session
-    Create {
-        /// Session name
-        name: String,
+        /// Browser to use
+        #[arg(short, long, default_value = "firefox")]
+        browser: String,
 
         /// Profile to use
         #[arg(short, long)]
         profile: Option<String>,
+
+        /// Viewport size for responsive testing
+        #[arg(long)]
+        viewport: Option<String>,
+
+        /// Run browser in visible mode
+        #[arg(long = "no-headless")]
+        no_headless: bool,
+
+        /// Use a persistent tab
+        #[arg(long)]
+        tab: Option<String>,
     },
 
-    /// Destroy a session
-    Destroy {
-        /// Session name
-        name: String,
-    },
+    /// Validate page for accessibility and SEO
+    Validate {
+        /// URL to validate
+        url: String,
 
-    /// List all sessions
-    List,
-}
+        /// Type of validation (accessibility, seo, performance, all)
+        #[arg(long, default_value = "all")]
+        check: String,
 
-#[derive(Subcommand)]
-enum ProfileCommands {
-    /// Create a new profile
-    Create {
-        /// Profile name
-        name: String,
-
-        /// Browser type
+        /// Browser to use
         #[arg(short, long, default_value = "firefox")]
         browser: String,
+
+        /// Profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Run browser in visible mode
+        #[arg(long = "no-headless")]
+        no_headless: bool,
+
+        /// Output format
+        #[arg(short, long, default_value = "json")]
+        format: OutputFormat,
+
+        /// Use a persistent tab
+        #[arg(long)]
+        tab: Option<String>,
     },
 
-    /// Delete a profile
-    Delete {
-        /// Profile name
-        name: String,
+    /// Compare two pages or states
+    Compare {
+        /// First URL or state
+        url1: String,
+
+        /// Second URL or state
+        url2: String,
+
+        /// Type of comparison (visual, structure, content, all)
+        #[arg(long, default_value = "all")]
+        mode: String,
+
+        /// CSS selector to focus on (optional)
+        #[arg(short, long)]
+        selector: Option<String>,
+
+        /// Browser to use
+        #[arg(short, long, default_value = "firefox")]
+        browser: String,
+
+        /// Profile to use
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Viewport size
+        #[arg(long)]
+        viewport: Option<String>,
+
+        /// Run browser in visible mode
+        #[arg(long = "no-headless")]
+        no_headless: bool,
+
+        /// Output format
+        #[arg(short, long, default_value = "json")]
+        format: OutputFormat,
+
+        /// Use a persistent tab
+        #[arg(long)]
+        tab: Option<String>,
     },
-
-    /// List all profiles
-    List,
-
-    /// Clean up old profiles
-    Cleanup {
-        /// Delete profiles older than N days
-        #[arg(long, default_value = "7")]
-        older_than: u32,
-    },
-}
-
-#[derive(Subcommand)]
-enum DaemonCommands {
-    /// Run the daemon (in foreground)
-    Run,
-
-    /// Start the daemon (show instructions)
-    Start,
-
-    /// Stop the daemon
-    Stop,
-
-    /// Check daemon status
-    Status,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let result = run().await;
 
     // Always clean up WebDriver processes before exiting
     webdriver_manager::GLOBAL_WEBDRIVER_MANAGER.stop_all();
 
-    result
+    // Handle exit codes based on error type
+    match result {
+        Ok(()) => std::process::exit(EXIT_SUCCESS),
+        Err(err) => {
+            // Convert to our error type to get proper exit code
+            let webprobe_err: errors::WebprobeError = err.into();
+
+            // Output JSON error to stdout for programmatic consumption
+            let error_json = json!({
+                "error": true,
+                "message": webprobe_err.to_string(),
+                "exit_code": webprobe_err.exit_code()
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&error_json).unwrap_or_else(|_| "{}".to_string())
+            );
+
+            // Also log to stderr for human reading
+            eprintln!("Error: {}", webprobe_err);
+            std::process::exit(webprobe_err.exit_code());
+        }
+    }
 }
 
 async fn run() -> Result<()> {
-    // Initialize tracing
+    // Initialize tracing to stderr (so JSON output to stdout remains clean)
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "webprobe=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr) // Output logs to stderr
+                .with_target(false), // Don't show target module in logs
+        )
         .init();
 
     let cli = Cli::parse();
@@ -454,7 +731,6 @@ async fn run() -> Result<()> {
         Commands::Inspect {
             url,
             selector,
-            browser,
             profile,
             format,
             depth,
@@ -462,293 +738,14 @@ async fn run() -> Result<()> {
             index,
             expect_one,
             viewport,
-            no_headless,
             tab,
             console,
         } => {
-            info!(
-                "Inspecting {} on {} with browser {}",
-                selector, url, browser
-            );
-
-            // If daemon is running and we have a tab name, use daemon
-            if let Some(tab_name) = &tab
-                && daemon::DaemonClient::is_daemon_running()
-            {
-                use daemon::{DaemonClient, DaemonRequest, DaemonResponse};
-
-                let browser_type = BrowserType::from_str(&browser)?;
-                let request = DaemonRequest::Inspect {
-                    tab_name: tab_name.clone(),
-                    url: url.clone(),
-                    selector: selector.clone(),
-                    all,
-                    index,
-                    expect_one,
-                    profile: profile.clone(),
-                    browser: browser_type,
-                };
-
-                match DaemonClient::send_request(request) {
-                    Ok(DaemonResponse::InspectResult(results, logs)) => {
-                        match format {
-                            OutputFormat::Json => {
-                                if results.len() == 1 && !all {
-                                    println!("{}", serde_json::to_string_pretty(&results[0])?);
-                                } else {
-                                    println!("{}", serde_json::to_string_pretty(&results)?);
-                                }
-                            }
-                            OutputFormat::Simple => {
-                                for (i, result) in results.iter().enumerate() {
-                                    if results.len() > 1 {
-                                        println!(
-                                            "[{}] {}: {} element at ({}, {}) {}x{}px",
-                                            i,
-                                            result.selector,
-                                            result
-                                                .computed_styles
-                                                .get("tag")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("unknown"),
-                                            result.position.x,
-                                            result.position.y,
-                                            result.size.width,
-                                            result.size.height
-                                        );
-                                    } else {
-                                        println!(
-                                            "{}: {} element at ({}, {}) {}x{}px",
-                                            result.selector,
-                                            result
-                                                .computed_styles
-                                                .get("tag")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("unknown"),
-                                            result.position.x,
-                                            result.position.y,
-                                            result.size.width,
-                                            result.size.height
-                                        );
-                                    }
-                                    if let Some(text) = &result.text_content {
-                                        println!("  Text: {}", text);
-                                    }
-                                    if result.children_count > 0 {
-                                        println!("  Children: {}", result.children_count);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Display console logs if captured
-                        if let Some(logs) = logs
-                            && !logs.is_empty()
-                        {
-                            eprintln!("\n=== Console Logs ===");
-                            for log in logs {
-                                eprintln!("[{}] {}: {}", log.timestamp, log.level, log.message);
-                            }
-                        }
-
-                        return Ok(());
-                    }
-                    Ok(DaemonResponse::Error(e)) => {
-                        eprintln!("Error: {}", e);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to communicate with daemon: {}", e);
-                        eprintln!("Falling back to direct execution");
-                    }
-                    _ => {}
-                }
-            }
-
-            // Fallback to direct execution
-            let browser_type = BrowserType::from_str(&browser)?;
-            let viewport_size = viewport
-                .as_ref()
-                .map(|v| ViewportSize::parse(v))
-                .transpose()?;
-
-            let (results, console_logs) = if let Some(tab_name) = &tab {
-                // Use persistent tab
-                let tab_lock = GLOBAL_TAB_MANAGER
-                    .get_or_create_tab(tab_name, browser_type, profile, viewport_size, !no_headless)
-                    .await?;
-
-                // Check navigation need before locking
-                let needs_nav = GLOBAL_TAB_MANAGER.should_navigate(tab_name, &url).await;
-
-                let tab = tab_lock.lock().await;
-                let (elements, logs) = if needs_nav {
-                    tab.browser.goto(&url).await?;
-                    drop(tab);
-                    GLOBAL_TAB_MANAGER.update_tab_url(tab_name, &url).await?;
-                    let tab = tab_lock.lock().await;
-                    tab.browser
-                        .inspect_element_with_console(
-                            "", &selector, depth, all, index, expect_one, console,
-                        )
-                        .await?
-                } else {
-                    tab.browser
-                        .inspect_element_with_console(
-                            "", &selector, depth, all, index, expect_one, console,
-                        )
-                        .await?
-                };
-                (elements, logs)
-                // Don't close browser when using tabs
-            } else {
-                // One-shot mode - try daemon first for better performance
-                let (elements, logs) = if daemon::DaemonClient::is_daemon_running() {
-                    // Try to use daemon's browser pool
-                    match daemon::DaemonClient::send_request(
-                        daemon::DaemonRequest::OneShotInspect {
-                            url: url.clone(),
-                            selector: selector.clone(),
-                            browser: browser_type,
-                            depth,
-                            all,
-                            index,
-                            expect_one,
-                            viewport: viewport_size.clone(),
-                            headless: !no_headless,
-                            console,
-                        },
-                    ) {
-                        Ok(daemon::DaemonResponse::InspectResult(elements, logs)) => {
-                            info!("Used daemon browser pool for faster one-shot");
-                            (elements, logs)
-                        }
-                        Ok(daemon::DaemonResponse::Error(e)) => {
-                            // Daemon returned an error, fall back to normal one-shot
-                            debug!("Daemon pool failed ({}), using normal one-shot", e);
-                            let browser =
-                                Browser::new(browser_type, profile, viewport_size, !no_headless)
-                                    .await?;
-                            let (elements, logs) = browser
-                                .inspect_element_with_console(
-                                    &url, &selector, depth, all, index, expect_one, console,
-                                )
-                                .await?;
-                            browser.close().await?;
-                            (elements, logs)
-                        }
-                        Ok(_) => {
-                            // Unexpected response type
-                            info!("Unexpected daemon response type, using normal one-shot");
-                            let browser =
-                                Browser::new(browser_type, profile, viewport_size, !no_headless)
-                                    .await?;
-                            let (elements, logs) = browser
-                                .inspect_element_with_console(
-                                    &url, &selector, depth, all, index, expect_one, console,
-                                )
-                                .await?;
-                            browser.close().await?;
-                            (elements, logs)
-                        }
-                        Err(e) => {
-                            // Daemon communication failed, fall back to normal one-shot
-                            debug!("Daemon unavailable ({}), using normal one-shot", e);
-                            let browser =
-                                Browser::new(browser_type, profile, viewport_size, !no_headless)
-                                    .await?;
-                            let (elements, logs) = browser
-                                .inspect_element_with_console(
-                                    &url, &selector, depth, all, index, expect_one, console,
-                                )
-                                .await?;
-                            browser.close().await?;
-                            (elements, logs)
-                        }
-                    }
-                } else {
-                    // No daemon, use normal one-shot
-                    let browser =
-                        Browser::new(browser_type, profile, viewport_size, !no_headless).await?;
-                    let (elements, logs) = browser
-                        .inspect_element_with_console(
-                            &url, &selector, depth, all, index, expect_one, console,
-                        )
-                        .await?;
-                    browser.close().await?;
-                    (elements, logs)
-                };
-                (elements, logs)
-            };
-
-            // Display console logs if captured
-            if let Some(logs) = console_logs
-                && !logs.is_empty()
-            {
-                eprintln!("\n=== Console Logs ===");
-                for log in &logs {
-                    let prefix = match log.level.as_str() {
-                        "error" => "❌ ERROR",
-                        "warn" => "⚠️  WARN",
-                        "info" => "ℹ️  INFO",
-                        _ => "📝 LOG",
-                    };
-                    eprintln!("{}: {}", prefix, log.message);
-                }
-                eprintln!("==================\n");
-            }
-
-            match format {
-                OutputFormat::Json => {
-                    if results.len() == 1 && !all {
-                        // Single element, output as before
-                        println!("{}", serde_json::to_string_pretty(&results[0])?);
-                    } else {
-                        // Multiple elements, output as array
-                        println!("{}", serde_json::to_string_pretty(&results)?);
-                    }
-                }
-                OutputFormat::Simple => {
-                    for (i, result) in results.iter().enumerate() {
-                        if results.len() > 1 {
-                            println!(
-                                "[{}] {}: {} element at ({}, {}) {}x{}px",
-                                i,
-                                result.selector,
-                                result
-                                    .computed_styles
-                                    .get("tag")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown"),
-                                result.position.x,
-                                result.position.y,
-                                result.size.width,
-                                result.size.height
-                            );
-                        } else {
-                            println!(
-                                "{}: {} element at ({}, {}) {}x{}px",
-                                result.selector,
-                                result
-                                    .computed_styles
-                                    .get("tag")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown"),
-                                result.position.x,
-                                result.position.y,
-                                result.size.width,
-                                result.size.height
-                            );
-                        }
-                        if let Some(text) = &result.text_content {
-                            println!("  Text: {}", text);
-                        }
-                        if result.children_count > 0 {
-                            println!("  Children: {}", result.children_count);
-                        }
-                    }
-                }
-            }
+            commands::inspect::handle_inspect(
+                url, selector, profile, format, depth, all, index, expect_one, viewport, tab,
+                console,
+            )
+            .await?
         }
 
         Commands::Type {
@@ -761,76 +758,17 @@ async fn run() -> Result<()> {
             no_headless,
             tab,
         } => {
-            info!("Typing into {} on {}", selector, url);
-
-            // If daemon is running and we have a tab name, use daemon
-            if let Some(tab_name) = &tab
-                && daemon::DaemonClient::is_daemon_running()
-            {
-                use daemon::{DaemonClient, DaemonRequest, DaemonResponse};
-
-                let browser_type = BrowserType::from_str(&browser)?;
-                let request = DaemonRequest::Type {
-                    tab_name: tab_name.clone(),
-                    url: url.clone(),
-                    selector: selector.clone(),
-                    text: text.clone(),
-                    clear,
-                    profile: profile.clone(),
-                    browser: browser_type,
-                };
-
-                match DaemonClient::send_request(request) {
-                    Ok(DaemonResponse::Success(msg)) => {
-                        println!("{}", msg);
-                        return Ok(());
-                    }
-                    Ok(DaemonResponse::Error(e)) => {
-                        eprintln!("Error: {}", e);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to communicate with daemon: {}", e);
-                        eprintln!("Falling back to direct execution");
-                    }
-                    _ => {}
-                }
-            }
-
-            // Fallback to direct execution
-            let browser_type = BrowserType::from_str(&browser)?;
-
-            if let Some(tab_name) = &tab {
-                // Use persistent tab
-                let tab_lock = GLOBAL_TAB_MANAGER
-                    .get_or_create_tab(tab_name, browser_type, profile, None, !no_headless)
-                    .await?;
-
-                // Check if we need to navigate before locking the tab
-                let needs_nav = GLOBAL_TAB_MANAGER.should_navigate(tab_name, &url).await;
-
-                // Now lock the tab and perform operations
-                let tab = tab_lock.lock().await;
-
-                if needs_nav {
-                    tab.browser.goto(&url).await?;
-                    // Release the lock before calling update_tab_url
-                    drop(tab);
-                    GLOBAL_TAB_MANAGER.update_tab_url(tab_name, &url).await?;
-                    // Re-acquire the lock
-                    let tab = tab_lock.lock().await;
-                    tab.browser.type_text("", &selector, &text, clear).await?;
-                } else {
-                    tab.browser.type_text("", &selector, &text, clear).await?;
-                }
-            } else {
-                // One-shot mode
-                let browser_obj = Browser::new(browser_type, profile, None, !no_headless).await?;
-                browser_obj.type_text(&url, &selector, &text, clear).await?;
-                browser_obj.close().await?;
-            }
-
-            println!("Successfully typed text into element: {}", selector);
+            commands::r#type::handle_type(
+                url,
+                selector,
+                text,
+                clear,
+                browser,
+                profile,
+                no_headless,
+                tab,
+            )
+            .await?
         }
 
         Commands::Scroll {
@@ -844,46 +782,64 @@ async fn run() -> Result<()> {
             no_headless,
             tab,
         } => {
-            info!("Scrolling on {}", url);
+            commands::scroll::handle_scroll(
+                url,
+                selector,
+                by_x,
+                by_y,
+                to,
+                browser,
+                profile,
+                no_headless,
+                tab,
+            )
+            .await?
+        }
 
-            let browser_type = BrowserType::from_str(&browser)?;
+        Commands::Screenshot {
+            url,
+            selector,
+            output,
+            browser,
+            profile,
+            viewport,
+            no_headless,
+            tab,
+        } => {
+            commands::screenshot::handle_screenshot(
+                url,
+                selector,
+                output,
+                browser,
+                profile,
+                viewport,
+                no_headless,
+                tab,
+            )
+            .await?
+        }
 
-            if let Some(tab_name) = &tab {
-                // Use persistent tab
-                let tab_lock = GLOBAL_TAB_MANAGER
-                    .get_or_create_tab(tab_name, browser_type, profile, None, !no_headless)
-                    .await?;
-
-                let needs_nav = GLOBAL_TAB_MANAGER.should_navigate(tab_name, &url).await;
-
-                let tab = tab_lock.lock().await;
-                if needs_nav {
-                    tab.browser.goto(&url).await?;
-                    drop(tab);
-                    GLOBAL_TAB_MANAGER.update_tab_url(tab_name, &url).await?;
-                    let tab = tab_lock.lock().await;
-                    tab.browser
-                        .scroll("", selector.as_deref(), by_x, by_y, to.as_deref())
-                        .await?;
-                } else {
-                    tab.browser
-                        .scroll("", selector.as_deref(), by_x, by_y, to.as_deref())
-                        .await?;
-                }
-            } else {
-                // One-shot mode
-                let browser_obj = Browser::new(browser_type, profile, None, !no_headless).await?;
-                browser_obj
-                    .scroll(&url, selector.as_deref(), by_x, by_y, to.as_deref())
-                    .await?;
-                browser_obj.close().await?;
-            }
-
-            if let Some(to_pos) = &to {
-                println!("Scrolled to position: {}", to_pos);
-            } else {
-                println!("Scrolled by ({}, {}) pixels", by_x, by_y);
-            }
+        Commands::Iframe {
+            url,
+            iframe,
+            selector,
+            browser,
+            profile,
+            no_headless,
+            format,
+            tab,
+        } => {
+            commands::iframe::handle_iframe(
+                url,
+                iframe,
+                selector,
+                browser,
+                profile,
+                no_headless,
+                format,
+                tab,
+            )
+            .await?
         }
 
         Commands::Layout {
@@ -893,102 +849,22 @@ async fn run() -> Result<()> {
             max_elements,
             wait_stable,
             detect_shadow,
-            browser,
             profile,
-            no_headless,
             format,
             tab,
         } => {
-            info!("Analyzing layout of {} on {}", selector, url);
-
-            let browser_type = BrowserType::from_str(&browser)?;
-
-            let layout = if let Some(tab_name) = &tab {
-                // Use persistent tab
-                let tab_lock = GLOBAL_TAB_MANAGER
-                    .get_or_create_tab(tab_name, browser_type, profile, None, !no_headless)
-                    .await?;
-
-                let needs_nav = GLOBAL_TAB_MANAGER.should_navigate(tab_name, &url).await;
-
-                let tab = tab_lock.lock().await;
-                if needs_nav {
-                    tab.browser.goto(&url).await?;
-                    drop(tab);
-                    GLOBAL_TAB_MANAGER.update_tab_url(tab_name, &url).await?;
-                    let tab = tab_lock.lock().await;
-                    tab.browser
-                        .analyze_layout(
-                            "",
-                            &selector,
-                            depth,
-                            max_elements,
-                            wait_stable,
-                            detect_shadow,
-                        )
-                        .await?
-                } else {
-                    tab.browser
-                        .analyze_layout(
-                            "",
-                            &selector,
-                            depth,
-                            max_elements,
-                            wait_stable,
-                            detect_shadow,
-                        )
-                        .await?
-                }
-            } else {
-                // One-shot mode
-                let browser_obj = Browser::new(browser_type, profile, None, !no_headless).await?;
-                let result = browser_obj
-                    .analyze_layout(
-                        &url,
-                        &selector,
-                        depth,
-                        max_elements,
-                        wait_stable,
-                        detect_shadow,
-                    )
-                    .await?;
-                browser_obj.close().await?;
-                result
-            };
-
-            match format {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&layout)?);
-                }
-                OutputFormat::Simple => {
-                    println!("Layout Analysis for: {}", layout.selector);
-                    println!("Tag: {}, Classes: {:?}", layout.tag, layout.classes);
-                    println!("Position: ({}, {})", layout.bounds.x, layout.bounds.y);
-                    println!("Size: {}x{}", layout.bounds.width, layout.bounds.height);
-                    println!("Box Model:");
-                    println!(
-                        "  Margin: T:{} R:{} B:{} L:{}",
-                        layout.box_model.margin.top,
-                        layout.box_model.margin.right,
-                        layout.box_model.margin.bottom,
-                        layout.box_model.margin.left
-                    );
-                    println!(
-                        "  Padding: T:{} R:{} B:{} L:{}",
-                        layout.box_model.padding.top,
-                        layout.box_model.padding.right,
-                        layout.box_model.padding.bottom,
-                        layout.box_model.padding.left
-                    );
-                    println!("Elements analyzed: {}", layout.element_count);
-                    if !layout.warnings.is_empty() {
-                        println!("Warnings: {:?}", layout.warnings);
-                    }
-                    if layout.truncated {
-                        println!("Note: Analysis was truncated at {} elements", max_elements);
-                    }
-                }
-            }
+            commands::layout::handle_layout(
+                url,
+                selector,
+                depth,
+                max_elements,
+                wait_stable,
+                detect_shadow,
+                profile,
+                format,
+                tab,
+            )
+            .await?
         }
 
         Commands::Eval {
@@ -998,28 +874,20 @@ async fn run() -> Result<()> {
             profile,
             no_headless,
             format,
+            tab,
+            unsafe_eval,
         } => {
-            info!("Executing JavaScript with browser {}", browser);
-
-            let browser_type = BrowserType::from_str(&browser)?;
-            let browser = Browser::new(browser_type, profile, None, !no_headless).await?;
-
-            let result = browser.execute_javascript(url.as_deref(), &code).await?;
-
-            browser.close().await?;
-
-            match format {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&result)?);
-                }
-                OutputFormat::Simple => match result {
-                    serde_json::Value::String(s) => println!("{}", s),
-                    serde_json::Value::Number(n) => println!("{}", n),
-                    serde_json::Value::Bool(b) => println!("{}", b),
-                    serde_json::Value::Null => println!("null"),
-                    _ => println!("{}", result),
-                },
-            }
+            commands::eval::handle_eval(
+                url,
+                code,
+                browser,
+                profile,
+                no_headless,
+                format,
+                tab,
+                unsafe_eval,
+            )
+            .await?
         }
 
         Commands::Click {
@@ -1032,217 +900,120 @@ async fn run() -> Result<()> {
             no_headless,
             tab,
         } => {
-            info!("Clicking {} on {}", selector, url);
-
-            // If daemon is running and we have a tab name, use daemon
-            if let Some(tab_name) = &tab
-                && daemon::DaemonClient::is_daemon_running()
-            {
-                use daemon::{DaemonClient, DaemonRequest, DaemonResponse};
-
-                let browser_type = BrowserType::from_str(&browser_name)?;
-                let request = DaemonRequest::Click {
-                    tab_name: tab_name.clone(),
-                    url: url.clone(),
-                    selector: selector.clone(),
-                    index,
-                    profile: profile.clone(),
-                    browser: browser_type,
-                };
-
-                match DaemonClient::send_request(request) {
-                    Ok(DaemonResponse::Success(msg)) => {
-                        println!("{}", msg);
-                        return Ok(());
-                    }
-                    Ok(DaemonResponse::Error(e)) => {
-                        eprintln!("Error: {}", e);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to communicate with daemon: {}", e);
-                        eprintln!("Falling back to direct execution");
-                    }
-                    _ => {}
-                }
-            }
-
-            // Fallback to direct execution
-            let browser_type = BrowserType::from_str(&browser_name)?;
-            let viewport_size = viewport
-                .as_ref()
-                .map(|v| ViewportSize::parse(v))
-                .transpose()?;
-
-            if let Some(tab_name) = &tab {
-                // Use persistent tab
-                let tab_lock = GLOBAL_TAB_MANAGER
-                    .get_or_create_tab(tab_name, browser_type, profile, viewport_size, !no_headless)
-                    .await?;
-
-                // Check navigation need before locking
-                let needs_nav = GLOBAL_TAB_MANAGER.should_navigate(tab_name, &url).await;
-
-                let tab = tab_lock.lock().await;
-                if needs_nav {
-                    tab.browser.goto(&url).await?;
-                    drop(tab);
-                    GLOBAL_TAB_MANAGER.update_tab_url(tab_name, &url).await?;
-                    let tab = tab_lock.lock().await;
-                    tab.browser.click_element("", &selector, index).await?;
-                } else {
-                    tab.browser.click_element("", &selector, index).await?;
-                }
-            } else {
-                // One-shot mode
-                let browser =
-                    Browser::new(browser_type, profile, viewport_size, !no_headless).await?;
-                browser.click_element(&url, &selector, index).await?;
-                browser.close().await?;
-            }
-
-            if let Some(idx) = index {
-                println!(
-                    "Successfully clicked element: {} at index {}",
-                    selector, idx
-                );
-            } else {
-                println!("Successfully clicked element: {}", selector);
-            }
+            commands::click::handle_click(
+                url,
+                selector,
+                index,
+                browser_name,
+                profile,
+                viewport,
+                no_headless,
+                tab,
+            )
+            .await?
         }
 
-        Commands::Session { command } => match command {
-            SessionCommands::Create { name, profile: _ } => {
-                info!("Creating session: {}", name);
-                println!("Session '{}' created", name);
-            }
-            SessionCommands::Destroy { name } => {
-                info!("Destroying session: {}", name);
-                println!("Session '{}' destroyed", name);
-            }
-            SessionCommands::List => {
-                println!("No sessions currently active");
-            }
-        },
-
-        Commands::Tab { command } => {
-            use daemon::{DaemonClient, DaemonRequest, DaemonResponse};
-
-            // Since we're CLI-only, tabs only exist in the daemon
-            if !DaemonClient::is_daemon_running() {
-                println!("No daemon running. Start with: webprobe daemon run");
-                println!("Tabs only persist with the daemon running.");
-                return Ok(());
-            }
-
-            match command {
-                TabCommands::List { profile } => {
-                    match DaemonClient::send_request(DaemonRequest::ListTabs {
-                        profile: profile.clone(),
-                    }) {
-                        Ok(DaemonResponse::TabList(tabs)) => {
-                            if tabs.is_empty() {
-                                println!("No active tabs");
-                            } else {
-                                println!("Active tabs:");
-                                for tab in tabs {
-                                    let url_str = tab.url.as_deref().unwrap_or("(no URL)");
-                                    let profile_str = tab
-                                        .profile
-                                        .as_deref()
-                                        .map(|p| format!(" [profile: {}]", p))
-                                        .unwrap_or_default();
-                                    println!("  {}{} - {}", tab.name, profile_str, url_str);
-                                }
-                            }
-                        }
-                        Ok(DaemonResponse::Error(e)) => {
-                            eprintln!("Error: {}", e);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to communicate with daemon: {}", e);
-                        }
-                        _ => {}
-                    }
-                }
-                TabCommands::Close { name } => {
-                    match DaemonClient::send_request(DaemonRequest::CloseTab { name: name.clone() })
-                    {
-                        Ok(DaemonResponse::Success(msg)) => {
-                            println!("{}", msg);
-                        }
-                        Ok(DaemonResponse::Error(e)) => {
-                            eprintln!("Error: {}", e);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to communicate with daemon: {}", e);
-                        }
-                        _ => {}
-                    }
-                }
-                TabCommands::CloseAll => {
-                    // Send close requests for all tabs
-                    match DaemonClient::send_request(DaemonRequest::ListTabs { profile: None }) {
-                        Ok(DaemonResponse::TabList(tabs)) => {
-                            let count = tabs.len();
-                            for tab in tabs {
-                                let _ = DaemonClient::send_request(DaemonRequest::CloseTab {
-                                    name: tab.name,
-                                });
-                            }
-                            println!("Closed {} tab(s)", count);
-                        }
-                        _ => {
-                            eprintln!("Failed to get tab list from daemon");
-                        }
-                    }
-                }
-            }
+        Commands::Batch {
+            commands,
+            tab: tab_name,
+            browser,
+            stop_on_error,
+            headless,
+            profile,
+            viewport,
+        } => {
+            commands::batch::handle_batch(
+                commands,
+                tab_name,
+                browser,
+                stop_on_error,
+                headless,
+                profile,
+                viewport,
+            )
+            .await?
         }
 
-        Commands::Profile { command } => {
-            let manager = ProfileManager::new()?;
+        Commands::Detect {
+            url,
+            context,
+            tab,
+            browser,
+            profile,
+        } => commands::detect::handle_detect(url, context, tab, browser, profile).await?,
 
-            match command {
-                ProfileCommands::Create { name, browser } => {
-                    info!("Creating profile: {} for {}", name, browser);
-                    manager.create_profile(&name, &browser)?;
-                    println!("Profile '{}' created for {}", name, browser);
-                }
-                ProfileCommands::Delete { name } => {
-                    info!("Deleting profile: {}", name);
-                    manager.delete_profile(&name)?;
-                    println!("Profile '{}' deleted", name);
-                }
-                ProfileCommands::List => {
-                    let profiles = manager.list_profiles()?;
-                    if profiles.is_empty() {
-                        println!("No profiles found");
-                    } else {
-                        println!("Profiles:");
-                        for profile in profiles {
-                            println!(
-                                "  {} ({}) - created: {}, last used: {}{}",
-                                profile.name,
-                                profile.browser,
-                                profile.created_at.format("%Y-%m-%d %H:%M"),
-                                profile.last_used.format("%Y-%m-%d %H:%M"),
-                                if profile.is_temporary {
-                                    " [temporary]"
-                                } else {
-                                    ""
-                                }
-                            );
-                        }
-                    }
-                }
-                ProfileCommands::Cleanup { older_than } => {
-                    info!("Cleaning profiles older than {} days", older_than);
-                    let cleaned = manager.cleanup_old_profiles(older_than)?;
-                    println!("Cleaned {} profiles", cleaned);
-                }
-            }
+        Commands::FindText {
+            text,
+            url,
+            element_type,
+            fuzzy,
+            case_sensitive,
+            all,
+            index,
+            tab,
+            profile,
+            format,
+        } => {
+            commands::find_text::handle_find_text(
+                url,
+                text,
+                element_type,
+                fuzzy,
+                case_sensitive,
+                all,
+                index,
+                tab,
+                profile,
+                format,
+            )
+            .await?
         }
+
+        Commands::WaitNavigation {
+            url,
+            to,
+            timeout,
+            tab: tab_name,
+            browser,
+        } => {
+            commands::wait_navigation::handle_wait_navigation(url, to, timeout, tab_name, browser)
+                .await?
+        }
+
+        Commands::WaitIdle {
+            url,
+            timeout,
+            idle_time,
+            tab,
+            browser,
+            profile,
+            no_headless,
+            show_log,
+        } => {
+            commands::wait_idle::handle_wait_idle(
+                url,
+                timeout,
+                idle_time,
+                tab,
+                browser,
+                profile,
+                no_headless,
+                show_log,
+            )
+            .await?
+        }
+
+        Commands::Session { command } => commands::session::handle_session(command).await?,
+
+        Commands::Tab { command } => commands::tab::handle_tab(command).await?,
+
+        Commands::Status {
+            tab: tab_name,
+            browser,
+            profile,
+        } => commands::status::handle_status(tab_name, browser, profile).await?,
+
+        Commands::Profile { command } => commands::profile::handle_profile(command).await?,
 
         Commands::Analyze {
             url,
@@ -1256,351 +1027,98 @@ async fn run() -> Result<()> {
             format,
             tab,
         } => {
-            info!("Analyzing {} on {} with focus: {}", selector, url, focus);
-
-            let browser_type = BrowserType::from_str(&browser)?;
-
-            let analysis = if let Some(tab_name) = &tab {
-                // Use persistent tab
-                let tab_lock = GLOBAL_TAB_MANAGER
-                    .get_or_create_tab(tab_name, browser_type, profile, None, !no_headless)
-                    .await?;
-
-                let needs_nav = GLOBAL_TAB_MANAGER.should_navigate(tab_name, &url).await;
-
-                let tab = tab_lock.lock().await;
-                if needs_nav {
-                    tab.browser.goto(&url).await?;
-                    drop(tab);
-                    GLOBAL_TAB_MANAGER.update_tab_url(tab_name, &url).await?;
-                    let tab = tab_lock.lock().await;
-                    tab.browser
-                        .analyze_context("", &selector, &focus, proximity, index)
-                        .await?
-                } else {
-                    tab.browser
-                        .analyze_context("", &selector, &focus, proximity, index)
-                        .await?
-                }
-            } else {
-                // One-shot mode
-                let browser_obj = Browser::new(browser_type, profile, None, !no_headless).await?;
-                let result = browser_obj
-                    .analyze_context(&url, &selector, &focus, proximity, index)
-                    .await?;
-                browser_obj.close().await?;
-                result
-            };
-
-            match format {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&analysis)?);
-                }
-                OutputFormat::Simple => {
-                    println!("Analysis complete for: {}", selector);
-                    println!("Focus: {}", focus);
-                    println!(
-                        "Elements analyzed: {}",
-                        analysis
-                            .as_object()
-                            .and_then(|o| o.get("element_count"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0)
-                    );
-                }
-            }
+            commands::analyze::handle_analyze(
+                url,
+                selector,
+                focus,
+                proximity,
+                index,
+                browser,
+                profile,
+                no_headless,
+                format,
+                tab,
+            )
+            .await?
         }
 
-        Commands::Daemon { command } => {
-            use daemon::{Daemon, DaemonClient, DaemonRequest};
+        Commands::Daemon { command } => commands::daemon::handle_daemon(command).await?,
 
-            match command {
-                DaemonCommands::Run => {
-                    if Daemon::is_running() {
-                        println!("Daemon is already running");
-                    } else {
-                        println!("Starting daemon...");
-                        let mut daemon = Daemon::new()?;
-                        daemon.start().await?;
-                    }
-                }
-                DaemonCommands::Start => {
-                    if Daemon::is_running() {
-                        println!("Daemon is already running");
-                    } else {
-                        println!("Starting daemon in background...");
 
-                        // Get log file path
-                        let log_dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
-                        let log_file = log_dir.join("webprobe-daemon.log");
+        Commands::Version => commands::version::handle_version().await?,
 
-                        // Fork and daemonize on Unix
-                        #[cfg(unix)]
-                        {
-                            use nix::unistd::{ForkResult, fork, setsid};
-                            use std::os::unix::io::AsRawFd;
-                            use std::os::unix::process::CommandExt;
-
-                            match unsafe { fork() } {
-                                Ok(ForkResult::Parent { .. }) => {
-                                    // Parent process: wait a bit and check if daemon started
-                                    std::thread::sleep(std::time::Duration::from_millis(500));
-
-                                    if Daemon::is_running() {
-                                        println!("Daemon started successfully");
-                                        println!("Log file: {}", log_file.display());
-                                    } else {
-                                        eprintln!(
-                                            "Failed to start daemon. Check log file: {}",
-                                            log_file.display()
-                                        );
-                                    }
-                                }
-                                Ok(ForkResult::Child) => {
-                                    // Child process: become a daemon
-                                    // Create new session
-                                    let _ = setsid();
-
-                                    // Redirect stdout/stderr to log file
-                                    let log_fd = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open(&log_file)?;
-
-                                    // Redirect stdout and stderr
-                                    let log_fd = log_fd.as_raw_fd();
-                                    nix::unistd::dup2(log_fd, 1)?; // stdout
-                                    nix::unistd::dup2(log_fd, 2)?; // stderr
-
-                                    // Close stdin
-                                    nix::unistd::close(0)?;
-
-                                    // Execute ourselves with daemon run
-                                    // This creates a fresh process without Tokio runtime issues
-                                    let exe_path = std::env::current_exe()?;
-                                    let _ = std::process::Command::new(exe_path)
-                                        .arg("daemon")
-                                        .arg("run")
-                                        .exec();
-
-                                    // If exec fails, exit
-                                    std::process::exit(1);
-                                }
-                                Err(e) => {
-                                    eprintln!("Fork failed: {}", e);
-                                }
-                            }
-                        }
-
-                        #[cfg(not(unix))]
-                        {
-                            // Windows or other platforms: use simple spawn approach
-                            use std::process::Command;
-                            let exe_path = std::env::current_exe()?;
-
-                            let child = Command::new(&exe_path)
-                                .arg("daemon")
-                                .arg("run")
-                                .stdin(std::process::Stdio::null())
-                                .stdout(std::fs::File::create(&log_file)?)
-                                .stderr(std::fs::File::create(&log_file)?)
-                                .spawn()?;
-
-                            std::mem::forget(child);
-
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-
-                            if Daemon::is_running() {
-                                println!("Daemon started successfully");
-                                println!("Log file: {}", log_file.display());
-                            } else {
-                                eprintln!(
-                                    "Failed to start daemon. Check log file: {}",
-                                    log_file.display()
-                                );
-                            }
-                        }
-                    }
-                }
-                DaemonCommands::Stop => {
-                    if DaemonClient::is_daemon_running() {
-                        match DaemonClient::send_request(DaemonRequest::Shutdown) {
-                            Ok(_) => println!("Daemon stopped"),
-                            Err(e) => println!("Failed to stop daemon: {}", e),
-                        }
-                    } else {
-                        println!("Daemon is not running");
-                    }
-                }
-                DaemonCommands::Status => {
-                    if DaemonClient::is_daemon_running() {
-                        match DaemonClient::send_request(DaemonRequest::Ping) {
-                            Ok(daemon::DaemonResponse::Pong) => {
-                                println!("Daemon is running");
-
-                                // List tabs
-                                if let Ok(daemon::DaemonResponse::TabList(tabs)) =
-                                    DaemonClient::send_request(DaemonRequest::ListTabs {
-                                        profile: None,
-                                    })
-                                    && !tabs.is_empty()
-                                {
-                                    println!("\nActive tabs:");
-                                    for tab in tabs {
-                                        println!(
-                                            "  {} - {}",
-                                            tab.name,
-                                            tab.url.as_deref().unwrap_or("(no URL)")
-                                        );
-                                    }
-                                }
-                            }
-                            _ => println!("Daemon is not responding properly"),
-                        }
-                    } else {
-                        println!("Daemon is not running");
-                    }
-                }
-            }
+        Commands::Diagnose {
+            url,
+            selector,
+            check,
+            browser,
+            profile,
+            viewport,
+            no_headless,
+            tab,
+        } => {
+            commands::diagnose::handle_diagnose(
+                url,
+                selector,
+                check,
+                browser,
+                profile,
+                viewport,
+                no_headless,
+                tab,
+            )
+            .await?
         }
 
-        #[cfg(feature = "mcp")]
-        Commands::McpServer => {
-            info!("Starting MCP server for Claude Code");
-
-            // Import MCP server module
-            use webprobe::mcp_server::WebProbeMcpServer;
-
-            // Create and run the MCP server
-            let server = WebProbeMcpServer::new();
-            server.run().await?;
+        Commands::Validate {
+            url,
+            check,
+            browser,
+            profile,
+            no_headless,
+            format,
+            tab,
+        } => {
+            commands::validate::handle_validate(
+                url,
+                check,
+                browser,
+                profile,
+                no_headless,
+                format,
+                tab,
+            )
+            .await?
         }
 
-        Commands::Version => {
-            const VERSION: &str = env!("CARGO_PKG_VERSION");
-            const NAME: &str = env!("CARGO_PKG_NAME");
-            const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
-
-            println!("{} v{}", NAME, VERSION);
-            println!("By: {}", AUTHORS);
-            println!("Repository: https://github.com/karthikkolli/webprobe");
-
-            // Check if running from a package manager
-            if std::env::var("HOMEBREW_PREFIX").is_ok() {
-                println!("Installed via: Homebrew");
-            } else if std::path::Path::new("/usr/bin/apt").exists()
-                && std::path::Path::new("/usr/share/doc/webprobe").exists()
-            {
-                println!("Installed via: APT (.deb)");
-            } else if std::path::Path::new("/usr/bin/dnf").exists()
-                || std::path::Path::new("/usr/bin/yum").exists()
-            {
-                println!("Installed via: RPM");
-            }
+        Commands::Compare {
+            url1,
+            url2,
+            mode,
+            selector,
+            browser,
+            profile,
+            viewport,
+            no_headless,
+            format,
+            tab,
+        } => {
+            commands::compare::handle_compare(
+                url1,
+                url2,
+                mode,
+                selector,
+                browser,
+                profile,
+                viewport,
+                no_headless,
+                format,
+                tab,
+            )
+            .await?
         }
 
-        Commands::Update { install } => {
-            check_for_updates(install).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn check_for_updates(auto_install: bool) -> Result<()> {
-    const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-    const REPO: &str = "karthikkolli/webprobe";
-
-    println!("Current version: v{}", CURRENT_VERSION);
-    println!("Checking for updates...");
-
-    // Fetch latest release from GitHub API
-    let client = reqwest::Client::new();
-    let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
-
-    let response = client
-        .get(&url)
-        .header("User-Agent", "webprobe-updater")
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        println!("Failed to check for updates: {}", response.status());
-        return Ok(());
-    }
-
-    let release: serde_json::Value = response.json().await?;
-    let latest_version = release["tag_name"]
-        .as_str()
-        .unwrap_or("unknown")
-        .trim_start_matches('v');
-
-    if latest_version == CURRENT_VERSION {
-        println!("✅ You are running the latest version!");
-        return Ok(());
-    }
-
-    println!("🆕 New version available: v{}", latest_version);
-    println!(
-        "Release notes: {}",
-        release["html_url"].as_str().unwrap_or("")
-    );
-
-    // Detect installation method
-    let update_cmd = if std::env::var("HOMEBREW_PREFIX").is_ok() {
-        Some("brew upgrade webprobe")
-    } else if std::path::Path::new("/usr/bin/apt").exists()
-        && std::path::Path::new("/usr/share/doc/webprobe").exists()
-    {
-        Some("sudo apt update && sudo apt upgrade webprobe")
-    } else if std::path::Path::new("/usr/bin/dnf").exists() {
-        Some("sudo dnf upgrade webprobe")
-    } else if std::path::Path::new("/usr/bin/yum").exists() {
-        Some("sudo yum update webprobe")
-    } else if std::path::Path::new("/usr/local/bin/webprobe").exists() {
-        Some(
-            "curl -fsSL https://raw.githubusercontent.com/karthikkolli/webprobe/main/install.sh | bash",
-        )
-    } else {
-        None
-    };
-
-    if let Some(cmd) = update_cmd {
-        println!("\nTo update, run:");
-        println!("  {}", cmd);
-
-        if auto_install {
-            println!("\nAttempting automatic update...");
-            let shell = if cfg!(target_os = "windows") {
-                "cmd"
-            } else {
-                "sh"
-            };
-            let flag = if cfg!(target_os = "windows") {
-                "/C"
-            } else {
-                "-c"
-            };
-
-            let status = std::process::Command::new(shell)
-                .arg(flag)
-                .arg(cmd)
-                .status()?;
-
-            if status.success() {
-                println!("✅ Update completed successfully!");
-                println!("Please restart webprobe to use the new version.");
-            } else {
-                println!("❌ Automatic update failed. Please run the update command manually.");
-            }
-        }
-    } else {
-        println!("\nTo update manually:");
-        println!(
-            "  1. Download from: https://github.com/{}/releases/latest",
-            REPO
-        );
-        println!("  2. Or reinstall using: cargo install webprobe");
+        Commands::Update { install } => commands::update::handle_update(install).await?,
     }
 
     Ok(())

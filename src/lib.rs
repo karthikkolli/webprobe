@@ -195,6 +195,9 @@
 //! # }
 //! ```
 
+/// Browser manager for tab management and isolation
+pub mod browser_manager;
+
 /// Profile management for browser sessions
 pub mod profile;
 
@@ -207,9 +210,6 @@ pub mod webdriver;
 /// Automatic WebDriver process management
 pub mod webdriver_manager;
 
-/// MCP (Model Context Protocol) server for Claude Code integration
-#[cfg(feature = "mcp")]
-pub mod mcp_server;
 
 pub use profile::ProfileManager;
 pub use types::{
